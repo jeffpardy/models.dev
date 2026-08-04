@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { formatToml, preserveReasoningOptions, syncProvider, type SyncProvider } from "../src/sync/index.js";
+import { formatToml, preserveReasoningOptions, syncProvider, type ExistingModel, type SyncProvider } from "../src/sync/index.js";
 import {
   anthropic,
   buildAnthropicModel,
@@ -51,6 +51,7 @@ import {
 import { openai, parseOpenAIModels } from "../src/sync/providers/openai.js";
 import { pioneer } from "../src/sync/providers/pioneer.js";
 import { google, shouldTrackGoogleModel } from "../src/sync/providers/google.js";
+import { buildTinfoilModel, tinfoil, type TinfoilModel } from "../src/sync/providers/tinfoil.js";
 import { resolveVeniceBaseModel } from "../src/sync/providers/venice.js";
 import { buildVercelModel, vercel } from "../src/sync/providers/vercel.js";
 import { buildWandbModel, type WandbModel } from "../src/sync/providers/wandb.js";
@@ -176,6 +177,30 @@ test("accepts only NanoGPT's supported reasoning effort values", () => {
   expect(NanoGptResponse.safeParse({
     data: [{ ...nanoGptModel(), reasoning_efforts: ["default"] }],
   }).success).toBe(false);
+  expect(NanoGptResponse.safeParse({ data: [] }).success).toBe(false);
+});
+
+test("normalizes authoritative NanoGPT reasoning efforts and preserves incomplete controls", () => {
+  const contradictory = buildNanoGptModel(nanoGptModel({
+    capabilities: { reasoning: false },
+    reasoning_efforts: ["high", "low", "high"],
+  }), undefined);
+  const incomplete = buildNanoGptModel(nanoGptModel({
+    capabilities: { reasoning: true },
+    reasoning_efforts: [],
+  }), {
+    reasoning: true,
+    reasoning_options: [{ type: "toggle" }, { type: "budget_tokens" }],
+  });
+
+  expect(contradictory).toMatchObject({
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+  });
+  expect(incomplete).toMatchObject({
+    reasoning: true,
+    reasoning_options: [{ type: "toggle" }, { type: "budget_tokens" }],
+  });
 });
 
 test("factors NanoGPT variants against canonical models without retaining wrong intrinsic metadata", () => {
@@ -733,6 +758,96 @@ test("tracks public Google model families but not opaque internal IDs", () => {
   expect(shouldTrackGoogleModel("thorin")).toBe(false);
 });
 
+function tinfoilModel(overrides: Partial<TinfoilModel> = {}): TinfoilModel {
+  return {
+    id: "glm-5-2",
+    object: "model",
+    owned_by: "tinfoil",
+    name: "GLM-5.2",
+    created: 1_775_088_000,
+    context_window: 384_000,
+    pricing: {
+      inputTokenPricePer1M: 1.5,
+      outputTokenPricePer1M: 5.25,
+      cachedInputTokenPricePer1M: 0.375,
+      requestPrice: 0,
+    },
+    reasoning: true,
+    tool_calling: true,
+    multimodal: false,
+    type: "chat",
+    ...overrides,
+  };
+}
+
+const existingTinfoilGLM: ExistingModel = {
+  base_model: "zhipuai/glm-5.2",
+  name: "GLM-5.2",
+  description: "Flagship GLM model for agentic engineering and coding",
+  family: "glm",
+  release_date: "2026-04-02",
+  last_updated: "2026-04-02",
+  attachment: false,
+  reasoning: true,
+  reasoning_options: [{
+    type: "effort",
+    values: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  }],
+  temperature: true,
+  tool_call: true,
+  structured_output: true,
+  open_weights: true,
+  cost: { input: 1.5, output: 5.25 },
+  limit: { context: 384_000, output: 131_072 },
+  modalities: { input: ["text"], output: ["text"] },
+};
+
+test("syncs Tinfoil cached-input pricing from the public model catalog", () => {
+  const model = buildTinfoilModel(tinfoilModel(), existingTinfoilGLM);
+
+  expect(model).toMatchObject({
+    base_model: "zhipuai/glm-5.2",
+    cost: {
+      input: 1.5,
+      output: 5.25,
+      cache_read: 0.375,
+    },
+    limit: { context: 384_000 },
+  });
+});
+
+test("removes stale Tinfoil cache pricing when the public catalog omits it", () => {
+  const model = buildTinfoilModel(tinfoilModel({
+    pricing: {
+      inputTokenPricePer1M: 1.5,
+      outputTokenPricePer1M: 5.25,
+      requestPrice: 0,
+    },
+  }), {
+    ...existingTinfoilGLM,
+    cost: { input: 1.5, output: 5.25, cache_read: 0.375 },
+  });
+
+  expect(model).toMatchObject({
+    cost: { input: 1.5, output: 5.25 },
+  });
+  expect(model.cost).not.toHaveProperty("cache_read");
+});
+
+test("tracks new token-priced Tinfoil models but ignores per-request services", () => {
+  expect(tinfoil.sourceID(tinfoilModel({ id: "new-chat-model" }))).toBe("new-chat-model");
+  expect(tinfoil.sourceID(tinfoilModel({
+    id: "websearch",
+    context_window: undefined,
+    type: "tool",
+    pricing: {
+      inputTokenPricePer1M: 0,
+      outputTokenPricePer1M: 0,
+      requestPrice: 0.05,
+    },
+  }))).toBeUndefined();
+});
+
 function digitalOceanModel(overrides: Partial<DigitalOceanSourceModel> = {}): DigitalOceanSourceModel {
   return {
     id: "anthropic-claude-4.6-sonnet",
@@ -985,7 +1100,7 @@ test("maps DigitalOcean 1M catalog pricing to its 200K threshold", () => {
 test("syncs DigitalOcean reasoning capability, efforts, and lifecycle status", () => {
   const model = buildDigitalOceanModel(digitalOceanModel({
     lifecycle_status: "deprecated",
-    thinking: false,
+    thinking: true,
     reasoning_efforts: ["none", "low", "medium", "high", "max", "unsupported"],
   }), {
     name: "Claude Sonnet 4.6",
@@ -1012,9 +1127,271 @@ test("syncs DigitalOcean reasoning capability, efforts, and lifecycle status", (
   });
 });
 
+test("uses DigitalOcean reasoning efforts over curated capability metadata", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    id: "openai-gpt-4o-mini",
+    name: "OpenAI GPT-4o mini",
+    thinking: false,
+    reasoning_efforts: ["low", "medium", "high"],
+    context_window: 128_000,
+    max_output_tokens: 16_384,
+    modalities: { input: ["text", "image"], output: ["text"] },
+    pricing: { input: 0.15, output: 0.6, cacheRead: 0.075 },
+  }), {
+    name: "GPT-4o mini",
+    description: "Compact GPT model",
+    family: "gpt-mini",
+    release_date: "2024-07-18",
+    last_updated: "2024-07-18",
+    attachment: true,
+    reasoning: false,
+    temperature: true,
+    tool_call: true,
+    open_weights: false,
+    cost: { input: 0.15, output: 0.6, cache_read: 0.075 },
+    limit: { context: 128_000, output: 16_384 },
+    modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+  });
+
+  expect(model).toMatchObject({
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+    modalities: { input: ["text", "image"], output: ["text"] },
+  });
+  expect(model).not.toHaveProperty("base_model");
+});
+
+test("preserves DigitalOcean reasoning metadata when efforts are empty", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    thinking: undefined,
+    reasoning_efforts: [],
+  }), {
+    name: "Reasoning model",
+    description: "Curated model",
+    release_date: "2026-01-01",
+    last_updated: "2026-01-01",
+    attachment: false,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    tool_call: true,
+    open_weights: false,
+    cost: { input: 1, output: 2 },
+    limit: { context: 128_000, output: 32_000 },
+    modalities: { input: ["text"], output: ["text"] },
+  });
+
+  expect(model).toMatchObject({
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+  });
+});
+
+test("uses explicit DigitalOcean thinking false when efforts are empty", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    thinking: false,
+    reasoning_efforts: [],
+  }), {
+    name: "Reasoning model",
+    description: "Curated model",
+    release_date: "2026-01-01",
+    last_updated: "2026-01-01",
+    attachment: false,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    tool_call: true,
+    open_weights: false,
+    cost: { input: 1, output: 2 },
+    limit: { context: 128_000, output: 32_000 },
+    modalities: { input: ["text"], output: ["text"] },
+  });
+
+  expect(model.reasoning).toBe(false);
+  expect(model.reasoning_options).toBeUndefined();
+});
+
+test("uses DigitalOcean effort lists over curated values", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    id: "openai-gpt-5.2",
+    name: "OpenAI GPT-5.2",
+    thinking: true,
+    reasoning_efforts: ["minimal", "low", "medium", "high"],
+    context_window: 400_000,
+    max_output_tokens: 128_000,
+    modalities: { input: ["text", "image"], output: ["text"] },
+    pricing: { input: 1.75, output: 14, cacheRead: 0.175 },
+  }), {
+    name: "GPT-5.2",
+    description: "GPT model",
+    family: "gpt",
+    release_date: "2025-12-11",
+    last_updated: "2025-12-11",
+    attachment: true,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["none", "low", "medium", "high", "xhigh"] }],
+    temperature: false,
+    tool_call: true,
+    open_weights: false,
+    cost: { input: 1.75, output: 14, cache_read: 0.175 },
+    limit: { context: 400_000, output: 128_000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+  });
+
+  expect(model).toMatchObject({
+    reasoning: true,
+    reasoning_options: [{
+      type: "effort",
+      values: ["minimal", "low", "medium", "high"],
+    }],
+  });
+  expect(model).not.toHaveProperty("base_model");
+});
+
+test("normalizes DigitalOcean x-high effort tokens and uses lifecycle status", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    name: "Nemotron Super (Public Preview)",
+    lifecycle_status: "active",
+    thinking: true,
+    reasoning_efforts: ["low", "x-high", "max"],
+  }), {
+    name: "Nemotron Super",
+    description: "Nemotron model",
+    family: "nemotron",
+    release_date: "2026-03-11",
+    last_updated: "2026-04-16",
+    attachment: false,
+    reasoning: true,
+    temperature: true,
+    tool_call: true,
+    open_weights: true,
+    status: "beta",
+    cost: { input: 0.3, output: 0.65 },
+    limit: { context: 256_000, output: 32_768 },
+    modalities: { input: ["text"], output: ["text"] },
+  });
+
+  expect(model).toMatchObject({
+    reasoning_options: [{ type: "effort", values: ["low", "xhigh", "max"] }],
+  });
+  expect(model.status).toBeUndefined();
+});
+
+test("preserves DigitalOcean status when lifecycle metadata is blank", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    lifecycle_status: "  ",
+  }), {
+    name: "Preview model",
+    description: "Curated model",
+    release_date: "2026-01-01",
+    last_updated: "2026-01-01",
+    attachment: false,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    tool_call: true,
+    open_weights: false,
+    status: "beta",
+    cost: { input: 1, output: 2 },
+    limit: { context: 128_000, output: 32_000 },
+    modalities: { input: ["text"], output: ["text"] },
+  });
+
+  expect(model.status).toBe("beta");
+});
+
+test("explicit DigitalOcean text-only modalities clear standalone attachment support", () => {
+  const model = buildDigitalOceanModel(digitalOceanModel({
+    modalities: { input: ["text"], output: ["text"] },
+  }), {
+    name: "Multimodal model",
+    description: "Curated model",
+    release_date: "2026-01-01",
+    last_updated: "2026-01-01",
+    attachment: true,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    tool_call: true,
+    open_weights: false,
+    cost: { input: 1, output: 2 },
+    limit: { context: 128_000, output: 32_000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+  });
+
+  expect(model).toMatchObject({
+    attachment: false,
+    modalities: { input: ["text"], output: ["text"] },
+  });
+});
+
+test("new DigitalOcean base models use explicit text-only catalog modalities", () => {
+  const model = buildDigitalOceanModel(
+    digitalOceanModel({
+      id: "anthropic-claude-5-sonnet",
+      name: "Anthropic Claude Sonnet 5",
+      thinking: true,
+      reasoning_efforts: ["low", "medium", "high", "max", "x-high"],
+      modalities: { input: ["text"], output: ["text"] },
+      context_window: 1_000_000,
+      max_output_tokens: 128_000,
+      pricing: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+    }),
+    undefined,
+  );
+
+  expect(model).toMatchObject({
+    base_model: "anthropic/claude-sonnet-5",
+    name: "Anthropic Claude Sonnet 5",
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "max", "xhigh"] }],
+  });
+  expect(model).toMatchObject({
+    attachment: false,
+    modalities: { input: ["text"] },
+  });
+  // reasoning=true matches base metadata, so factorBaseModel omits it
+  expect(model).not.toHaveProperty("reasoning");
+});
+
+test("existing DigitalOcean base models use explicit text-only catalog modalities", () => {
+  const model = buildDigitalOceanModel(
+    digitalOceanModel({
+      id: "nemotron-nano-12b-v2-vl",
+      name: "Nemotron Nano 12B v2 VL",
+      modalities: { input: ["text"], output: ["text"] },
+      context_window: 128_000,
+      max_output_tokens: 16_384,
+      pricing: { input: 0.2, output: 0.6 },
+    }),
+    {
+      base_model: "nvidia/nemotron-nano-12b-v2-vl",
+      name: "Nemotron Nano 12B v2 VL",
+      description: "Nemotron vision-language model",
+      family: "nemotron",
+      release_date: "2025-12-01",
+      last_updated: "2026-04-30",
+      attachment: true,
+      reasoning: true,
+      reasoning_options: [{ type: "effort", values: ["none", "low", "medium", "high", "max"] }],
+      temperature: true,
+      tool_call: true,
+      open_weights: true,
+      cost: { input: 0.2, output: 0.6 },
+      limit: { context: 128_000, output: 16_384 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+    },
+  );
+
+  expect(model).toMatchObject({
+    base_model: "nvidia/nemotron-nano-12b-v2-vl",
+    attachment: false,
+    modalities: { input: ["text"] },
+  });
+});
+
 test("resolves DigitalOcean IDs to canonical model metadata", () => {
   expect(resolveDigitalOceanBaseModel("openai-gpt-5.5")).toBe("openai/gpt-5.5");
   expect(resolveDigitalOceanBaseModel("deepseek-v4-pro")).toBe("deepseek/deepseek-v4-pro");
+  expect(resolveDigitalOceanBaseModel("mimo-v2.5-pro")).toBe("xiaomi/mimo-v2.5-pro");
+  expect(resolveDigitalOceanBaseModel("anthropic-claude-5-sonnet")).toBe("anthropic/claude-sonnet-5");
+  expect(resolveDigitalOceanBaseModel("anthropic-claude-opus-5")).toBe("anthropic/claude-opus-5");
+  expect(resolveDigitalOceanBaseModel("openai-gpt-5.6-luna")).toBe("openai/gpt-5.6-luna");
 });
 
 test("new DigitalOcean base models inherit intrinsic capabilities", () => {
@@ -1036,6 +1413,31 @@ test("new DigitalOcean base models inherit intrinsic capabilities", () => {
   expect(model).not.toHaveProperty("knowledge");
   expect(model).not.toHaveProperty("reasoning");
   expect(model).not.toHaveProperty("temperature");
+});
+
+test("new DigitalOcean MiMo models factor xiaomi base metadata", () => {
+  const model = buildDigitalOceanModel(
+    digitalOceanModel({
+      id: "mimo-v2.5-pro",
+      name: "MiMo V2.5 Pro",
+      thinking: undefined,
+      reasoning_efforts: undefined,
+      modalities: { input: ["text"], output: ["text"] },
+      pricing: { input: 0.6, output: 3, cacheRead: 0.16 },
+      context_window: 262_144,
+      max_output_tokens: 52_429,
+    }),
+    undefined,
+  );
+
+  expect(model).toMatchObject({
+    base_model: "xiaomi/mimo-v2.5-pro",
+    name: "MiMo V2.5 Pro",
+    cost: { input: 0.6, output: 3, cache_read: 0.16 },
+    limit: { context: 262_144, output: 52_429 },
+  });
+  expect(model).not.toHaveProperty("reasoning");
+  expect(model).not.toHaveProperty("open_weights");
 });
 
 test("xAI sync factors inherited base model fields", () => {
@@ -1090,6 +1492,208 @@ test("xAI sync factors inherited base model fields", () => {
   expect(model).not.toHaveProperty("release_date");
   expect(model).not.toHaveProperty("last_updated");
   expect(model).not.toHaveProperty("limit");
+});
+
+test("xAI sync maps long-context API pricing into cost tiers", () => {
+  const model = buildXAIModel(
+    {
+      id: "grok-4.5",
+      created: Date.parse("2026-06-29T00:00:00Z") / 1000,
+      input_modalities: ["text", "image"],
+      output_modalities: ["text"],
+      prompt_text_token_price: 20_000,
+      cached_prompt_text_token_price: 3_000,
+      completion_text_token_price: 60_000,
+      prompt_text_token_price_long_context: 40_000,
+      cached_prompt_text_token_price_long_context: 6_000,
+      completion_text_token_price_long_context: 120_000,
+      long_context_threshold: 200_000,
+      max_prompt_length: 500_000,
+    },
+    {
+      base_model: "xai/grok-4.5",
+      name: "Grok 4.5",
+      family: "grok",
+      release_date: "2026-07-08",
+      last_updated: "2026-07-08",
+      attachment: true,
+      reasoning: true,
+      tool_call: true,
+      open_weights: false,
+      cost: {
+        input: 2,
+        output: 6,
+        cache_read: 0.3,
+        // Stale hand-authored tier must be overwritten by API long-context rates.
+        tiers: [{ tier: { size: 200_000 }, input: 4, output: 12, cache_read: 1 }],
+      },
+      limit: { context: 500_000, output: 500_000 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+    },
+  );
+
+  expect(model).toMatchObject({
+    cost: {
+      input: 2,
+      output: 6,
+      cache_read: 0.3,
+      tiers: [{
+        tier: { type: "context", size: 200_000 },
+        input: 4,
+        output: 12,
+        cache_read: 0.6,
+      }],
+    },
+  });
+});
+
+test("xAI sync keeps authored tiers when long-context rates are omitted", () => {
+  const model = buildXAIModel(
+    {
+      id: "grok-4.5",
+      created: Date.parse("2026-06-29T00:00:00Z") / 1000,
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      prompt_text_token_price: 20_000,
+      cached_prompt_text_token_price: 3_000,
+      completion_text_token_price: 60_000,
+      // Positive threshold without long-context rates must not invent a base-priced tier.
+      long_context_threshold: 200_000,
+      max_prompt_length: 500_000,
+    },
+    {
+      name: "Grok 4.5",
+      family: "grok",
+      release_date: "2026-07-08",
+      last_updated: "2026-07-08",
+      attachment: false,
+      reasoning: true,
+      tool_call: true,
+      open_weights: false,
+      cost: {
+        input: 2,
+        output: 6,
+        cache_read: 0.3,
+        tiers: [{ tier: { size: 200_000 }, input: 4, output: 12, cache_read: 0.6 }],
+      },
+      limit: { context: 500_000, output: 500_000 },
+      modalities: { input: ["text"], output: ["text"] },
+    },
+  );
+
+  expect(model).toMatchObject({
+    cost: {
+      tiers: [{ tier: { size: 200_000 }, input: 4, output: 12, cache_read: 0.6 }],
+    },
+  });
+});
+
+test("xAI sync clears cost tiers when API reports no long-context band", () => {
+  const model = buildXAIModel(
+    {
+      id: "grok-code-fast-1",
+      created: Date.parse("2025-01-01T00:00:00Z") / 1000,
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      prompt_text_token_price: 2_000,
+      cached_prompt_text_token_price: 200,
+      completion_text_token_price: 15_000,
+      prompt_text_token_price_long_context: 0,
+      cached_prompt_text_token_price_long_context: 0,
+      completion_text_token_price_long_context: 0,
+      long_context_threshold: 0,
+      max_prompt_length: 256_000,
+    },
+    {
+      name: "Grok Code Fast 1",
+      family: "grok",
+      release_date: "2025-01-01",
+      last_updated: "2025-01-01",
+      attachment: false,
+      reasoning: true,
+      tool_call: true,
+      open_weights: false,
+      cost: {
+        input: 0.2,
+        output: 1.5,
+        cache_read: 0.02,
+        tiers: [{ tier: { size: 200_000 }, input: 0.4, output: 3 }],
+      },
+      limit: { context: 256_000, output: 256_000 },
+      modalities: { input: ["text"], output: ["text"] },
+    },
+  );
+
+  expect(model).toMatchObject({
+    cost: {
+      input: 0.2,
+      output: 1.5,
+      cache_read: 0.02,
+    },
+  });
+  expect(model.cost?.tiers).toBeUndefined();
+});
+
+test("OpenRouter sync maps pricing.overrides into cost tiers", () => {
+  const model = buildOpenRouterModel(openRouterModel({
+    id: "x-ai/grok-4.5",
+    name: "xAI: Grok 4.5",
+    pricing: {
+      prompt: "0.000002",
+      completion: "0.000006",
+      input_cache_read: "0.0000003",
+      overrides: [{
+        min_prompt_tokens: 200_000,
+        prompt: "0.000004",
+        completion: "0.000012",
+        input_cache_read: "0.0000006",
+      }],
+    },
+  }), {
+    cost: {
+      input: 2,
+      output: 6,
+      cache_read: 0.3,
+      tiers: [{ tier: { size: 200_000 }, input: 4, output: 12, cache_read: 1 }],
+    },
+  });
+
+  expect(model).toMatchObject({
+    cost: {
+      input: 2,
+      output: 6,
+      cache_read: 0.3,
+      tiers: [{
+        tier: { type: "context", size: 200_000 },
+        input: 4,
+        output: 12,
+        cache_read: 0.6,
+      }],
+    },
+  });
+});
+
+test("OpenRouter sync keeps authored tiers when API omits overrides", () => {
+  const model = buildOpenRouterModel(openRouterModel({
+    pricing: {
+      prompt: "0.000002",
+      completion: "0.00001",
+      input_cache_read: "0.0000002",
+      input_cache_write: "0.0000025",
+    },
+  }), {
+    cost: {
+      input: 3,
+      output: 15,
+      tiers: [{ tier: { size: 200_000 }, input: 6, output: 22.5 }],
+    },
+  });
+
+  expect(model).toMatchObject({
+    cost: {
+      tiers: [{ tier: { size: 200_000 }, input: 6, output: 22.5 }],
+    },
+  });
 });
 
 test("skips new DigitalOcean models with incomplete pricing or limits", () => {
